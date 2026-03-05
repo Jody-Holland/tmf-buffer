@@ -8,7 +8,7 @@ import sys
 import time
 from multiprocessing import Manager, Process, Queue, cpu_count
 from typing import Mapping
-from osgeo import gdal  # type: ignore
+from osgeo import gdal, gdal_array  # type: ignore # Import gdal_array
 import numpy as np
 import pandas as pd
 from yirgacheffe.layers import RasterLayer  # type: ignore
@@ -17,7 +17,7 @@ from methods.common.luc import luc_matching_columns
 from methods.matching.calculate_k import build_layer_collection
 from methods.utils.dranged_tree import DRangedTree
 
-DIVISIONS = 1000
+DIVISIONS = 100
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -46,12 +46,24 @@ def key_builder(start_year: int):
     return _build_key
 
 def load_k(
-    k_filename: str,
+    k_directory: str,
     start_year: int,
 ) -> Mapping[int, DRangedTree]:
 
-    print("Reading k...")
-    source_pixels = pd.read_parquet(k_filename)
+    logging.info(f"Reading K set Parquet files from directory: {k_directory}")
+    parquet_files = glob.glob(os.path.join(k_directory, "k_*.parquet"))
+
+    if not parquet_files:
+        logging.error(f"No Parquet files found in directory: {k_directory}")
+        sys.exit(1)
+
+    logging.info(f"Found {len(parquet_files)} Parquet files. Concatenating...")
+
+    # Read and concatenate all found parquet files
+    df_list = [pd.read_parquet(f) for f in parquet_files]
+    source_pixels = pd.concat(df_list, ignore_index=True)
+
+    logging.info(f"Concatenated K set contains {len(source_pixels)} total points.")
 
     # Split source_pixels into classes
     source_classes = defaultdict(list)
@@ -61,7 +73,7 @@ def load_k(
         key = build_key_for_row(row)
         source_classes[key].append(row)
 
-    print("Building k trees...")
+    logging.info("Building k trees...")
 
     source_trees = {}
     for key, values in source_classes.items():
@@ -70,12 +82,12 @@ def load_k(
                 row.elevation,
                 row.slope,
                 row.access,
-                row["cpc0_u"],
-                row["cpc0_d"],
-                row["cpc5_u"],
-                row["cpc5_d"],
-                row["cpc10_u"],
-                row["cpc10_d"],
+                row["fcc0_u"],
+                row["fcc0_d"],
+                row["fcc5_u"],
+                row["fcc5_d"],
+                row["fcc10_u"],
+                row["fcc10_d"],
                 ) for row in values
             ]),
             np.array([
@@ -92,15 +104,15 @@ def load_k(
             1 / 100, # This is the fraction of R that is in M, used to optimize search speed.
         )
 
-    print("k trees built.")
+    logging.info(f"Built {len(source_trees)} k trees.")
 
     return source_trees
 
 def worker(
-    worker_index: int,
+    worker_index: int, # Keep worker_index for logging if needed
     matching_zone_filename: str,
     jrc_directory_path: str,
-    cpc_directory_path: str,
+    fcc_directory_path: str,
     ecoregions_directory_path: str,
     elevation_directory_path: str,
     slope_directory_path: str,
@@ -116,6 +128,7 @@ def worker(
     example_jrc_filename = glob.glob("*.tif", root_dir=jrc_directory_path)[0]
     example_jrc_layer = RasterLayer.layer_from_file(os.path.join(jrc_directory_path, example_jrc_filename))
 
+    # Build the layer collection once per worker
     matching_collection = build_layer_collection(
         example_jrc_layer.pixel_scale,
         example_jrc_layer.projection,
@@ -123,7 +136,7 @@ def worker(
         [start_year, start_year - 5, start_year - 10],
         matching_zone_filename,
         jrc_directory_path,
-        cpc_directory_path,
+        fcc_directory_path,
         ecoregions_directory_path,
         elevation_directory_path,
         slope_directory_path,
@@ -131,84 +144,164 @@ def worker(
         countries_raster_filename,
     )
 
-    result_path = os.path.join(result_folder, f"{worker_index}.tif")
-
-    matching_pixels = RasterLayer.empty_raster_layer_like(matching_collection.boundary, filename=result_path)
+    # Get overall dimensions and stride
     xsize = matching_collection.boundary.window.xsize
     ysize = matching_collection.boundary.window.ysize
-    xstride = math.ceil(xsize)
+    xstride = math.ceil(xsize) # Process full width
     ystride = math.ceil(ysize / DIVISIONS)
 
     # Iterate our assigned pixels
     while True:
         coords = coordinate_queue.get()
         if coords is None:
+            logging.debug(f"Worker {worker_index} received None, finishing.")
             break
-        print(f"Worker {worker_index} starting coords {coords}...")
-        ypos, xpos = coords
+
+        ypos, xpos = coords # xpos should always be 0 here as we process full width
+        logging.debug(f"Worker {worker_index} starting strip ypos={ypos}...")
+
+        # --- Define output path based on the strip (ypos) ---
+        result_path = os.path.join(result_folder, f"strip_{ypos:04d}.tif") # Use ypos for consistent naming
+
+        # --- Create the output layer for this specific strip ---
+        # Use the overall layer's properties but specify the filename for this strip
+        try:
+            matching_pixels = RasterLayer.empty_raster_layer_like(
+                matching_collection.boundary,
+                filename=result_path
+            )
+        except Exception as e:
+            logging.error(f"Worker {worker_index} failed to create output file {result_path}: {e}")
+            continue # Skip this strip if file creation fails
+
+        # Calculate bounds for this strip
         ymin = ypos * ystride
-        xmin = xpos * xstride
+        xmin = 0 # Start at the left edge
         ymax = min(ymin + ystride, ysize)
-        xmax = min(xmin + xstride, xsize)
+        xmax = xsize # Go to the right edge
         xwidth = xmax - xmin
         ywidth = ymax - ymin
+
         if xwidth <= 0 or ywidth <= 0:
-            print(f"Worker {worker_index} coords {coords} are outside boundary")
+            logging.warning(f"Worker {worker_index} strip ypos={ypos} resulted in zero dimensions, skipping.")
+            # Clean up the potentially created empty file
+            try:
+                del matching_pixels._dataset # Release handle if possible
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+            except Exception as cleanup_e:
+                 logging.error(f"Worker {worker_index} error cleaning up {result_path}: {cleanup_e}")
             continue
-        boundary = matching_collection.boundary.read_array(xmin, ymin, xwidth, ywidth)
-        elevations = matching_collection.elevation.read_array(xmin, ymin, xwidth, ywidth)
-        ecoregions = matching_collection.ecoregions.read_array(xmin, ymin, xwidth, ywidth)
-        slopes = matching_collection.slope.read_array(xmin, ymin, xwidth, ywidth)
-        accesses = matching_collection.access.read_array(xmin, ymin, xwidth, ywidth)
-        lucs = [x.read_array(xmin, ymin, xwidth, ywidth) for x in matching_collection.lucs]
 
-        # CPC must be in JRC resolution
-        cpcs = [
-            cpc.read_array(xmin, ymin, xwidth, ywidth)
-            for cpc in matching_collection.cpcs
-        ]
+        # Read data for the strip
+        try:
+            boundary = matching_collection.boundary.read_array(xmin, ymin, xwidth, ywidth)
+            elevations = matching_collection.elevation.read_array(xmin, ymin, xwidth, ywidth)
+            ecoregions = matching_collection.ecoregions.read_array(xmin, ymin, xwidth, ywidth)
+            slopes = matching_collection.slope.read_array(xmin, ymin, xwidth, ywidth)
+            accesses = matching_collection.access.read_array(xmin, ymin, xwidth, ywidth)
+            lucs = [x.read_array(xmin, ymin, xwidth, ywidth) for x in matching_collection.lucs]
+            fccs = [fcc.read_array(xmin, ymin, xwidth, ywidth) for fcc in matching_collection.fccs]
+            countries = matching_collection.countries.read_array(xmin, ymin, xwidth, ywidth)
+        except Exception as read_e:
+            logging.error(f"Worker {worker_index} failed reading data for strip ypos={ypos}: {read_e}")
+            # Clean up the potentially created empty file
+            try:
+                del matching_pixels._dataset # Release handle if possible
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+            except Exception as cleanup_e:
+                 logging.error(f"Worker {worker_index} error cleaning up {result_path}: {cleanup_e}")
+            continue # Skip processing this strip
 
-        countries = matching_collection.countries.read_array(xmin, ymin, xwidth, ywidth)
-        points = np.zeros((ywidth, xwidth))
-        for ypos in range(ywidth):
-            for xpos in range(xwidth):
-                if boundary[ypos, xpos] == 0:
+        # Process pixels within the strip
+        try:
+            # Convert GDAL datatype code to NumPy dtype
+            numpy_dtype = gdal_array.GDALTypeCodeToNumericTypeCode(matching_pixels.datatype)
+            points = np.zeros((ywidth, xwidth), dtype=numpy_dtype) # Use the converted NumPy dtype
+        except Exception as dtype_e:
+             logging.error(f"Worker {worker_index} failed to determine numpy dtype from GDAL type {matching_pixels.datatype} for strip ypos={ypos}: {dtype_e}")
+             # Clean up the potentially created empty file
+             try:
+                 del matching_pixels._dataset # Release handle if possible
+                 if os.path.exists(result_path):
+                     os.remove(result_path)
+             except Exception as cleanup_e:
+                 logging.error(f"Worker {worker_index} error cleaning up {result_path} after dtype failure: {cleanup_e}")
+             continue # Skip this strip
+
+        for y_local in range(ywidth):
+            for x_local in range(xwidth):
+                if boundary[y_local, x_local] == 0:
                     continue
-                ecoregion = ecoregions[ypos, xpos]
-                country = countries[ypos, xpos]
-                luc0 = lucs[0][ypos, xpos]
-                luc5 = lucs[1][ypos, xpos]
-                luc10 = lucs[2][ypos, xpos]
-                key = build_key(ecoregion, country, luc0, luc5, luc10)
-                if key in ktrees:
-                    points[ypos, xpos] = 1 if ktrees[key].contains(np.array([
-                        elevations[ypos, xpos],
-                        slopes[ypos, xpos],
-                        accesses[ypos, xpos],
-                        cpcs[0][ypos, xpos],
-                        cpcs[1][ypos, xpos],
-                        cpcs[2][ypos, xpos],
-                        cpcs[3][ypos, xpos],
-                        cpcs[4][ypos, xpos],
-                        cpcs[5][ypos, xpos],
-                    ])) else 0
-        # Write points to output
-        # pylint: disable-next=protected-access
-        matching_pixels._dataset.GetRasterBand(1).WriteArray(points, xmin, ymin)
-        print(f"Worker {worker_index} completed coords {coords}.")
-    print(f"Worker {worker_index} finished.")
+                ecoregion = ecoregions[y_local, x_local]
+                country = countries[y_local, x_local]
+                luc0 = lucs[0][y_local, x_local]
+                luc5 = lucs[1][y_local, x_local]
+                luc10 = lucs[2][y_local, x_local]
 
-    # Ensure we flush pixels to disk now we're finished
-    del matching_pixels._dataset
+                # Check for nodata or invalid values before building key
+                if any(val is None or val < 0 for val in [ecoregion, country, luc0, luc5, luc10]):
+                    continue
+
+                try:
+                    key = build_key(ecoregion, country, luc0, luc5, luc10)
+                except ValueError: # Catch errors from build_key if values are out of expected range
+                    continue
+
+                if key in ktrees:
+                    # Check for nodata in continuous variables
+                    covariates = np.array([
+                        elevations[y_local, x_local],
+                        slopes[y_local, x_local],
+                        accesses[y_local, x_local],
+                        fccs[0][y_local, x_local], # fcc0_u
+                        fccs[1][y_local, x_local], # fcc0_d
+                        fccs[2][y_local, x_local], # fcc5_u
+                        fccs[3][y_local, x_local], # fcc5_d
+                        fccs[4][y_local, x_local], # fcc10_u
+                        fccs[5][y_local, x_local], # fcc10_d
+                    ])
+                    # Assuming nodata is represented by NaN or a specific negative value; adjust check if needed
+                    if np.isnan(covariates).any() or (covariates < -999).any(): # Example check
+                        continue
+
+                    try:
+                        if ktrees[key].contains(covariates):
+                            points[y_local, x_local] = 1
+                    except Exception as tree_e:
+                         logging.warning(f"Worker {worker_index} error during tree check for strip ypos={ypos}, pixel ({x_local},{y_local}): {tree_e}")
+                         continue # Skip this pixel if tree check fails
+
+        # Write points to the output file for this strip
+        try:
+            # pylint: disable-next=protected-access
+            matching_pixels._dataset.GetRasterBand(1).WriteArray(points, xmin, ymin)
+            # Explicitly close the dataset for this strip to ensure it's written
+            del matching_pixels._dataset
+            logging.debug(f"Worker {worker_index} completed and saved strip ypos={ypos} to {result_path}.")
+        except Exception as write_e:
+            logging.error(f"Worker {worker_index} failed writing data for strip ypos={ypos} to {result_path}: {write_e}")
+            # Attempt cleanup if write fails
+            try:
+                if '_dataset' in locals() and matching_pixels._dataset is not None:
+                     del matching_pixels._dataset
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+            except Exception as cleanup_e:
+                 logging.error(f"Worker {worker_index} error cleaning up {result_path} after write failure: {cleanup_e}")
+
+    logging.info(f"Worker {worker_index} finished.")
+    # Removed the final del matching_pixels._dataset as it's handled per strip
 
 
 def find_potential_matches(
-    k_filename: str,
+    k_directory: str,
     start_year: int,
     evaluation_year: int,
     matching_zone_filename: str,
     jrc_directory_path: str,
-    cpc_directory_path: str,
+    fcc_directory_path: str,
     ecoregions_directory_path: str,
     elevation_directory_path: str,
     slope_directory_path: str,
@@ -224,19 +317,20 @@ def find_potential_matches(
 
         worker_count = processes_count
 
-        # Fill the co-ordinate queue
+        # Fill the co-ordinate queue with strip indices (ypos)
         for ypos in range(DIVISIONS):
-            coordinate_queue.put([ypos, 0])
+            coordinate_queue.put([ypos, 0]) # Keep format [ypos, xpos], xpos is always 0
+        # Add termination signals for workers
         for _ in range(worker_count):
             coordinate_queue.put(None)
 
-        ktree = load_k(k_filename, start_year)
+        ktree = load_k(k_directory, start_year)
 
         workers = [Process(target=worker, args=(
             index,
             matching_zone_filename,
             jrc_directory_path,
-            cpc_directory_path,
+            fcc_directory_path,
             ecoregions_directory_path,
             elevation_directory_path,
             slope_directory_path,
@@ -251,16 +345,34 @@ def find_potential_matches(
         for worker_process in workers:
             worker_process.start()
 
-        while workers:
-            candidates = [x for x in workers if not x.is_alive()]
-            for candidate in candidates:
-                candidate.join()
-                if candidate.exitcode:
-                    for victim in workers:
-                        victim.kill()
-                    sys.exit(candidate.exitcode)
-                workers.remove(candidate)
-            time.sleep(1)
+        # Monitor worker processes
+        active_workers = list(workers) # Create a copy to modify
+        while active_workers:
+            finished_workers = []
+            for proc in active_workers:
+                if not proc.is_alive():
+                    proc.join()
+                    if proc.exitcode != 0:
+                        logging.error(f"Worker process {proc.pid} exited with code {proc.exitcode}. Terminating others.")
+                        # Terminate remaining workers
+                        for other_proc in active_workers:
+                            if other_proc.is_alive():
+                                other_proc.terminate()
+                                other_proc.join(timeout=5) # Wait briefly for termination
+                                if other_proc.is_alive():
+                                     other_proc.kill() # Force kill if terminate fails
+                                     other_proc.join()
+                        sys.exit(f"Worker process failed with exit code {proc.exitcode}")
+                    finished_workers.append(proc)
+
+            # Remove finished workers from the active list
+            for proc in finished_workers:
+                active_workers.remove(proc)
+
+            if active_workers: # Avoid busy-waiting if workers are still running
+                time.sleep(1)
+
+        logging.info("All worker processes finished successfully.")
 
 
 def main():
@@ -269,8 +381,8 @@ def main():
         "--k",
         type=str,
         required=True,
-        dest="k_filename",
-        help="Parquet file containing pixels from K as generated by calculate_k.py"
+        dest="k_directory",
+        help="Directory containing K set Parquet files (k_*.parquet) as generated by calculate_k.py"
     )
     parser.add_argument(
         "--matching",
@@ -301,10 +413,10 @@ def main():
         help="Directory containing JRC AnnualChange GeoTIFF tiles for all years."
     )
     parser.add_argument(
-        "--cpc",
+        "--fcc",
         type=str,
         required=True,
-        dest="cpc_directory_path",
+        dest="fcc_directory_path",
         help="Filder containing Coarsened Proportional Coverage GeoTIFF tiles for all years."
     )
     parser.add_argument(
@@ -350,22 +462,22 @@ def main():
         help="Raster of country IDs."
     )
     parser.add_argument(
-        "-j",
+        "--j",
         type=int,
         required=False,
-        default=round(cpu_count() / 2),
+        default=round(cpu_count() / 4),
         dest="processes_count",
         help="Number of concurrent threads to use."
     )
     args = parser.parse_args()
 
     find_potential_matches(
-        args.k_filename,
+        args.k_directory,
         args.start_year,
         args.evaluation_year,
         args.matching_zone_filename,
         args.jrc_directory_path,
-        args.cpc_directory_path,
+        args.fcc_directory_path,
         args.ecoregions_directory_path,
         args.elevation_directory_path,
         args.slope_directory_path,

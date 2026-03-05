@@ -231,7 +231,7 @@ def _make_tree_internal(rects: np.ndarray, bounds: np.ndarray, state: TreeState)
         return SingletonTree(rects[0])
     if len(rects) < 50:
         return ListTree(rects)
-    if state.depth == 30:
+    if state.depth == 20:
         print(f"Limiting depth to {state.depth} with {len(rects)} rects remaining")
         return ListTree(rects)
 

@@ -15,9 +15,8 @@ from methods.inputs.generate_leakage import LEAKAGE_BUFFER_IN_METRES
 # will throw an error when it hits 200MB unless you override the limit thus
 os.environ["OGR_GEOJSON_MAX_OBJ_SIZE"] = "0"
 
-MATCHING_RADIUS_IN_METRES = 2_000_000
-
 def generate_matching_area(
+    matching_radius_in_metres: int,
     project_shape_filename: str,
     country_iso_a2_code_filename: str,
     countries_shape_filename: str,
@@ -26,7 +25,7 @@ def generate_matching_area(
     output_shape_filename: str
 ) -> None:
     project_boundaries = gpd.read_file(project_shape_filename)
-    extended_project = expand_boundaries(project_boundaries, MATCHING_RADIUS_IN_METRES)
+    extended_project = expand_boundaries(project_boundaries, matching_radius_in_metres)
     unified_extended_boundary = shapely.unary_union(extended_project)
 
     with open(country_iso_a2_code_filename, "r", encoding="utf-8") as codesfs:
@@ -90,6 +89,12 @@ def generate_matching_area(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generates pixel matching area")
     parser.add_argument(
+        "--matching_radius_metres",
+        type=int,
+        default=2_000_000,
+        help="Radius in metres around project to consider for matching area. Default: 500,000 (500km)."
+    )
+    parser.add_argument(
         "--project",
         type=str,
         required=True,
@@ -135,6 +140,7 @@ def main() -> None:
 
     try:
         generate_matching_area(
+            args.matching_radius_metres,
             args.project_shape_filename,
             args.country_list_filename,
             args.countries_shape_filename,

@@ -1,0 +1,6 @@
+MODE=single
+STEPS_RAW=14-15
+PROJ=gola_area
+T0=2012
+EVAL_YEAR=2024
+CSV_FILE=
