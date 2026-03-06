@@ -51,21 +51,37 @@ def _compute_effect_df(all_pairs_df):
     print(f"Most recent year found in k_luc_YYYY columns: {year}")
 
     k_col = f"k_luc_{year}"
+    k_access = f"k_access_{year}"
     s_col = f"s_{kind}_{year}"
+    s_access = f"s_access_{year}"
 
     k_vals = pd.to_numeric(all_pairs_df[k_col], errors="coerce")
+    k_access_vals = pd.to_numeric(all_pairs_df[k_access], errors="coerce") if k_access in all_pairs_df.columns else None
     s_vals = pd.to_numeric(all_pairs_df[s_col], errors="coerce")
+    s_access_vals = pd.to_numeric(all_pairs_df[s_access], errors="coerce") if s_access in all_pairs_df.columns else None
+    if kind == "luc":
+        s_vals = s_vals.where(s_vals <= 1, 0)
 
     k_vals = k_vals.where(k_vals <= 1, 0)
     effect = (k_vals-s_vals).clip(-1, 1)
-
-    out_df = pd.DataFrame(
-        {
-            "k_lat": pd.to_numeric(all_pairs_df[y_col], errors="coerce"),
-            "k_lng": pd.to_numeric(all_pairs_df[x_col], errors="coerce"),
-            "effect": effect,
-        }
-    ).dropna(subset=["k_lat", "k_lng", "effect"])
+    if kind == "luc":
+        out_df = pd.DataFrame(
+            {
+                "k_lat": pd.to_numeric(all_pairs_df[y_col], errors="coerce"),
+                "k_lng": pd.to_numeric(all_pairs_df[x_col], errors="coerce"),
+                "effect": effect,
+                "k_access": k_access_vals,
+                "s_access": s_access_vals,
+            }
+        ).dropna(subset=["k_lat", "k_lng", "effect", "k_access", "s_access"])
+    else:
+        out_df = pd.DataFrame(
+            {
+                "k_lat": pd.to_numeric(all_pairs_df[y_col], errors="coerce"),
+                "k_lng": pd.to_numeric(all_pairs_df[x_col], errors="coerce"),
+                "effect": effect
+            }
+        ).dropna(subset=["k_lat", "k_lng", "effect"])
 
     print(f"Using columns: {k_col} and {s_col}")
     print(f"Rows in effect parquet: {len(out_df)}")

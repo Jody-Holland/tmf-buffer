@@ -2,6 +2,9 @@
 *.npy
 data
 
+# csvs
+redd.csv
+placebo_base.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

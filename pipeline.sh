@@ -439,10 +439,12 @@ function run_pipeline {
       --use-fork \
       --min_potential_matches 100 \
       --similarity_mode hybrid_mahal_prop \
+      --m_sample_backend python \
+      --m_sample_python_exe python3 \
+      --m_sample_writer_threads 8 \
       --propensity_caliper 0.05 \
       --mahalanobis_lambda 0.8 \
       --mahalanobis_bandwidth 0.25 \
-      --cluster_k_first 1 \
       --max_potential_matches 500; then
       echo "--Pairs Hybrid Mahalanobis+Propensity (Julia) created.--"
     else
@@ -454,7 +456,7 @@ function run_pipeline {
   if should_run 14; then
     if run_and_log "$proj" tmfpython3 -m methods.outputs.calculate_additionality \
       --project-folder "${OUTPUT_DIR}/${proj}" \
-      --pairs-folder "pairs_hybrid" \
+      --pairs-folder "pairs_1000" \
       --og-geojson "${INPUT_DIR}/1201.geojson"; then
       echo "--Additionality calculated.--"
     else
